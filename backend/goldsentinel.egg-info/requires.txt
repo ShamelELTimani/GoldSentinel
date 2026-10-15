@@ -1,0 +1,19 @@
+fastapi<0.116,>=0.115
+uvicorn[standard]<1,>=0.30
+pydantic-settings<3,>=2.5
+sqlalchemy<3,>=2.0
+httpx<0.28,>=0.27
+anyio<4.10,>=4.3
+pandas<3,>=2.2
+numpy<3,>=1.26
+python-multipart<1,>=0.0.9
+
+[dev]
+pytest<9,>=8
+pytest-asyncio<1,>=0.24
+ruff<1,>=0.7
+
+[mt5]
+
+[mt5:platform_system == "Windows"]
+MetaTrader5>=5.0.45
