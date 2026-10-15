@@ -42,7 +42,9 @@ async def lifespan(_: FastAPI):
                 await service.news.refresh()
             except asyncio.CancelledError:
                 raise
-            await asyncio.sleep(settings.news_refresh_seconds)
+            await asyncio.sleep(
+                min(settings.news_refresh_seconds, settings.headline_refresh_seconds)
+            )
     task = asyncio.create_task(scan_loop(), name="goldsentinel-scan-loop")
     news_task = asyncio.create_task(news_loop(), name="goldsentinel-news-loop")
     try:
@@ -94,9 +96,19 @@ def status() -> dict:
     return service.status()
 
 
+@app.get("/api/quote")
+def quote() -> dict:
+    return service.quote_snapshot()
+
+
 @app.get("/api/market/{timeframe}")
 def market(timeframe: Timeframe, count: int = Query(350, ge=50, le=5000), offset: int = Query(0, ge=0)) -> dict:
     return service.market_snapshot(timeframe, count, offset)
+
+
+@app.get("/api/market/{timeframe}/live")
+def live_market(timeframe: Timeframe) -> dict:
+    return service.live_market(timeframe)
 
 
 @app.get("/api/market-diagnostics")

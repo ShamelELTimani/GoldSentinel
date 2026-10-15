@@ -9,6 +9,9 @@ def test_all_timeframes_are_retrievable(broker, timeframe):
     rows = broker.candles("XAUUSD.m", timeframe, 100)
     assert len(rows) == 100
     assert rows[-1].complete is False
+    quality = validate_candles(rows, timeframe)
+    assert quality.valid, quality.errors
+    assert quality.stale is False
 
 
 def test_indicators_do_not_mutate_candles(candles):

@@ -17,14 +17,16 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
     calendar_url: str | None = None
     calendar_api_key: str | None = None
-    calendar_provider: str = Field(default="generic_json", pattern="^(generic_json|fmp)$")
+    calendar_provider: str = Field(default="generic_json", pattern="^(generic_json|fmp|forex_factory)$")
     calendar_country: str = "US"
     calendar_days_back: int = Field(default=1, ge=0, le=89)
     calendar_days_ahead: int = Field(default=14, ge=0, le=89)
     news_url: str | None = None
     news_api_key: str | None = None
+    news_provider: str = Field(default="generic_json", pattern="^(generic_json|rss)$")
     news_fail_safe: bool = True
     news_refresh_seconds: int = Field(default=300, ge=60, le=3600)
+    headline_refresh_seconds: int = Field(default=300, ge=60, le=3600)
     polling_seconds: float = Field(default=2.0, ge=0.5, le=60)
 
     @model_validator(mode="after")

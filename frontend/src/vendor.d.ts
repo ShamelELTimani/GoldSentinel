@@ -1,7 +1,10 @@
 declare module 'lightweight-charts' {
   export type UTCTimestamp = number & { readonly __brand: unique symbol }
   export type IChartApi = any
+  export type IPriceLine = any
+  export type ISeriesApi<T = any> = any
   export const ColorType: any
+  export const LineStyle: any
   export const CandlestickSeries: any
   export const HistogramSeries: any
   export const LineSeries: any

@@ -8,7 +8,7 @@ from .brokers.base import Broker
 from .brokers.mock import MockBroker
 from .config import Settings
 from .database import Repository
-from .domain import DecisionAction, DecisionClass, RuntimeSettings, StrategyProfile, Timeframe, TradeCandidate, TradingMode
+from .domain import AccountSnapshot, DecisionAction, DecisionClass, Position, Quote, RuntimeSettings, StrategyProfile, Timeframe, TradeCandidate, TradingMode
 from .execution import ExecutionManager
 from .market import indicators, validate_candles
 from .news import NewsEngine
@@ -30,6 +30,9 @@ class GoldSentinelService:
         self.candidates: dict[str, TradeCandidate] = {}
         self.latest_candidate: TradeCandidate | None = None
         self.market_qualities: dict[Timeframe, dict] = {}
+        self.last_quote: Quote | None = None
+        self.last_account: AccountSnapshot | None = None
+        self.last_positions: list[Position] = []
         self._lock = RLock()
 
     def _make_broker(self) -> Broker:
@@ -111,7 +114,32 @@ class GoldSentinelService:
         metrics = indicators(candles) if len(candles) >= 20 else {"ema20": [], "ema50": [], "rsi": [], "atr": [], "latest": {}}
         zones = detect_zones(candles, timeframe)
         structure = structure_summary(candles)
-        return {"symbol": self.settings.symbol, "timeframe": timeframe, "source": self.broker.quote(self.settings.symbol).source, "candles": candles, "quality": quality.__dict__, "indicators": metrics, "zones": zones, "structure": structure}
+        return {"symbol": self.settings.symbol, "timeframe": timeframe, "source": self._quote().source, "candles": candles, "quality": quality.__dict__, "indicators": metrics, "zones": zones, "structure": structure}
+
+    def _quote(self) -> Quote:
+        quote = self.broker.quote(self.settings.symbol)
+        self.last_quote = quote
+        return quote
+
+    def quote_snapshot(self) -> dict:
+        try:
+            quote = self._quote()
+            error = None
+            connected = self.broker.is_connected()
+        except Exception as exc:
+            quote = self.last_quote
+            error = str(exc)
+            connected = False
+        if quote is None:
+            return {"connected": False, "quote": None, "spread": None, "age_seconds": None, "state": "DISCONNECTED", "stale": True, "error": error or "No broker quote has been received"}
+        age = max(0.0, (datetime.now(timezone.utc) - quote.timestamp).total_seconds())
+        live_window = max(5.0, self.settings.polling_seconds * 3)
+        state = "LIVE" if connected and age <= live_window else "QUIET" if connected and age <= 60 else "STALE" if connected else "DISCONNECTED"
+        return {"connected": connected, "quote": quote, "spread": quote.spread, "age_seconds": round(age, 3), "state": state, "stale": state in {"STALE", "DISCONNECTED"}, "error": error}
+
+    def live_market(self, timeframe: Timeframe) -> dict:
+        candles = self.broker.candles(self.settings.symbol, timeframe, 2)
+        return {"symbol": self.settings.symbol, "timeframe": timeframe, "candles": candles, **self.quote_snapshot()}
 
     def analyze(self, timeframe: Timeframe = Timeframe.m15) -> TradeCandidate:
         snapshot = self.market_snapshot(timeframe)
@@ -120,7 +148,8 @@ class GoldSentinelService:
             candidate = self.strategy._no_trade(self.settings.symbol, timeframe, snapshot["candles"][-1].close, reasons, DecisionClass.operational, reasons)
         else:
             news = self.news.risk_context(policy=self.runtime.risk.news_policy)
-            candidate = self.strategy.evaluate(self.settings.symbol, timeframe, snapshot["candles"], snapshot["zones"], self.broker.account(), self.broker.positions(self.settings.symbol), self.runtime.risk, self.runtime.strategy_profile, self.broker.symbol_spec(self.settings.symbol), news)
+            quote = self._quote()
+            candidate = self.strategy.evaluate(self.settings.symbol, timeframe, snapshot["candles"], snapshot["zones"], quote, self.broker.account(), self.broker.positions(self.settings.symbol), self.runtime.risk, self.runtime.strategy_profile, self.broker.symbol_spec(self.settings.symbol), news)
         self.candidates[candidate.id] = candidate
         self.latest_candidate = candidate
         self.repository.audit("SIGNAL", candidate.action.value, candidate.model_dump())
@@ -167,12 +196,36 @@ class GoldSentinelService:
         return {"candidate": fresh, "result": result}
 
     def status(self) -> dict:
-        quote = self.broker.quote(self.settings.symbol)
-        account = self.broker.account()
-        positions = self.broker.positions(self.settings.symbol)
+        quote_health = self.quote_snapshot()
+        quote = quote_health["quote"] or Quote(symbol=self.settings.symbol, bid=0, ask=0, timestamp=datetime.now(timezone.utc), source="UNAVAILABLE")
+        try:
+            account = self.broker.account()
+            positions = self.broker.positions(self.settings.symbol)
+            pending_orders = self.broker.pending_orders(self.settings.symbol)
+            self.last_account = account
+            self.last_positions = positions
+        except Exception as exc:
+            account = self.last_account or AccountSnapshot(
+                balance=0,
+                equity=0,
+                free_margin=0,
+                margin=0,
+                leverage=0,
+                is_demo=False,
+            )
+            positions = self.last_positions
+            pending_orders = []
+            quote_health.update(
+                {
+                    "connected": False,
+                    "state": "DISCONNECTED",
+                    "stale": True,
+                    "error": quote_health.get("error") or str(exc),
+                }
+            )
         open_risk = sum(item.initial_risk for item in positions)
         readiness = self._readiness(quote, account, positions)
-        return {"connected": self.broker.is_connected(), "broker": self.settings.broker.upper(), "symbol": self.settings.symbol, "data_source": quote.source, "quote": quote, "spread": quote.spread, "account": account, "runtime": self.runtime, "positions": positions, "pending_orders": self.broker.pending_orders(self.settings.symbol), "open_risk": round(open_risk, 2), "remaining_risk": round(max(0, account.equity * self.runtime.risk.max_combined_risk_pct / 100 - open_risk), 2), "latest_candidate": self.latest_candidate, "readiness": readiness, "server_time": datetime.now(timezone.utc), "news": self.news.status(self.runtime.risk.news_policy)}
+        return {"connected": quote_health["connected"], "broker": self.settings.broker.upper(), "symbol": self.settings.symbol, "data_source": quote.source, "quote": quote, "quote_health": {key: value for key, value in quote_health.items() if key != "quote"}, "spread": quote.spread, "account": account, "runtime": self.runtime, "positions": positions, "pending_orders": pending_orders, "open_risk": round(open_risk, 2), "remaining_risk": round(max(0, account.equity * self.runtime.risk.max_combined_risk_pct / 100 - open_risk), 2), "latest_candidate": self.latest_candidate, "readiness": readiness, "server_time": datetime.now(timezone.utc), "news": self.news.status(self.runtime.risk.news_policy)}
 
     def _readiness(self, quote, account, positions) -> dict:
         quality = self.market_qualities.get(Timeframe.m15)
@@ -180,8 +233,12 @@ class GoldSentinelService:
         combined_limit = account.equity * self.runtime.risk.max_combined_risk_pct / 100
         open_risk = sum(max(position.initial_risk, 0) for position in positions)
         broker_expected = "MT5" if self.settings.broker.lower() == "mt5" else "MOCK"
+        try:
+            broker_connected = self.broker.is_connected()
+        except Exception:
+            broker_connected = False
         checks = [
-            {"id": "mt5_connection", "label": "MT5 connection", "ready": self.broker.is_connected() and account.is_demo and quote.source == broker_expected, "detail": f"Connected to {quote.source} demo account" if self.broker.is_connected() and account.is_demo and quote.source == broker_expected else "MT5 demo connection or broker data source is not verified"},
+            {"id": "mt5_connection", "label": "MT5 connection", "ready": broker_connected and account.is_demo and quote.source == broker_expected, "detail": f"Connected to {quote.source} demo account" if broker_connected and account.is_demo and quote.source == broker_expected else "MT5 demo connection or broker data source is not verified"},
             {"id": "market_data", "label": "Market data", "ready": bool(quality and quality["valid"]), "detail": "M15 candles are fresh and structurally valid" if quality and quality["valid"] else "M15 market data has not validated or has a recent blocking issue"},
             {"id": "news", "label": "News availability", "ready": not news["block"], "detail": news["reason"]},
             {"id": "risk", "label": "Risk limits", "ready": len(positions) < self.runtime.risk.max_positions and open_risk < combined_limit, "detail": "Position count and combined open risk are within limits" if len(positions) < self.runtime.risk.max_positions and open_risk < combined_limit else "Position count or combined open-risk limit is reached"},

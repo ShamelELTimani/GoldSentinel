@@ -5,10 +5,10 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 os.environ.setdefault("GS_DATABASE_URL", "sqlite:///./backend/data/test.db")
-os.environ.setdefault("GS_API_TOKEN", "test-token")
+os.environ["GS_API_TOKEN"] = "test-token"
 os.environ["GS_BROKER"] = "mock"
 
-from goldsentinel.api import require_token, service
+from goldsentinel.api import require_token, service, settings
 from goldsentinel.domain import RiskSettings, TradingMode
 
 
@@ -18,7 +18,7 @@ def test_authentication_dependency_rejects_missing_and_bad_tokens():
     assert missing.value.status_code == 401
     with pytest.raises(HTTPException):
         require_token(x_api_token="wrong")
-    require_token(x_api_token="test-token")
+    require_token(x_api_token=settings.api_token)
 
 
 def test_risk_validation_is_server_side():
