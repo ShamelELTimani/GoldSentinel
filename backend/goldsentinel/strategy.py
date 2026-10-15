@@ -11,6 +11,7 @@ from .domain import (
     StrategyProfile,
     Timeframe,
     TradeCandidate,
+    TradeSetup,
     Zone,
     utcnow,
 )
@@ -277,4 +278,84 @@ class StrategyEngine:
                 if decision_class in {DecisionClass.operational, DecisionClass.risk}
                 else "REJECTED"
             ),
+        )
+
+    def evaluate_setup(
+        self,
+        symbol: str,
+        setup: TradeSetup,
+        quote: Quote,
+        account,
+        positions,
+        settings,
+        profile: StrategyProfile,
+        spec: dict,
+        news: dict,
+        context: dict,
+    ) -> TradeCandidate:
+        entry = quote.ask if setup.side == Side.buy else quote.bid
+        rationale = [
+            f"{setup.setup_type.value.replace('_', ' ').title()} {'inside a zone' if setup.in_zone else 'between zones'}",
+            setup.trigger,
+            *setup.reasons,
+            news["reason"],
+        ]
+        if news["block"]:
+            return self._no_trade(
+                symbol,
+                setup.timeframe,
+                entry,
+                rationale + ["News policy blocks this otherwise qualified setup"],
+                DecisionClass.operational,
+                [news["reason"]],
+            )
+        stop_distance = (entry - setup.stop_loss) if setup.side == Side.buy else (setup.stop_loss - entry)
+        target_distance = (setup.take_profit - entry) if setup.side == Side.buy else (entry - setup.take_profit)
+        min_stop = max(float(spec.get("trade_stops_level", 0)), float(spec.get("trade_freeze_level", 0))) * float(spec.get("point", 0.01))
+        if stop_distance <= 0 or target_distance <= 0 or min(stop_distance, target_distance) < min_stop:
+            return self._no_trade(symbol, setup.timeframe, entry, rationale + ["Executable quote invalidates protective levels"], evaluated_zones=0)
+        rr = target_distance / stop_distance
+        if rr < settings.preferred_min_rr:
+            return self._no_trade(symbol, setup.timeframe, entry, rationale + [f"Executable R:R {rr:.2f} is below {settings.preferred_min_rr:.2f}"], evaluated_zones=0)
+        risk = self.risk_manager.calculate(
+            RiskRequest(
+                side=setup.side,
+                entry=entry,
+                stop_loss=setup.stop_loss,
+                quality_score=setup.evidence_score,
+                news_factor=news["factor"],
+                setup_factor=0.9 if setup.setup_type.value == "TREND_CONTINUATION" else 1,
+            ),
+            account,
+            settings,
+            profile,
+            spec,
+            positions,
+            float(spec.get("daily_drawdown_pct", 0)),
+            int(spec.get("consecutive_losses", 0)),
+        )
+        if not risk.allowed:
+            return self._no_trade(symbol, setup.timeframe, entry, rationale + [risk.reason], DecisionClass.risk, [risk.reason])
+        return TradeCandidate(
+            action=DecisionAction(setup.side.value),
+            symbol=symbol,
+            timeframe=setup.timeframe,
+            entry=round(entry, 5),
+            stop_loss=setup.stop_loss,
+            take_profit=setup.take_profit,
+            volume=risk.volume,
+            risk_amount=risk.risk_amount,
+            risk_pct=risk.risk_pct,
+            reward_risk=round(rr, 2),
+            quality_score=setup.evidence_score,
+            news_status=news["status"],
+            rationale=rationale + [risk.reason],
+            spread_at_signal=round(quote.spread, 5),
+            max_price_deviation=round(max(quote.spread * 2, float(spec.get("trade_tick_size", spec.get("point", 0.01))) * 20), 5),
+            setup_type=setup.setup_type,
+            setup_fingerprint=setup.fingerprint,
+            entry_trigger=setup.trigger,
+            in_zone=setup.in_zone,
+            timeframe_context=context,
+            expires_at=setup.expires_at,
         )

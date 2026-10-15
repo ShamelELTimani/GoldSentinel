@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from ..domain import AccountSnapshot, BrokerResult, Candle, OrderRequest, Position, Quote, Timeframe
+from ..domain import AccountSnapshot, BrokerResult, Candle, OrderRequest, Position, Quote, Side, Timeframe
 
 
 class Broker(ABC):
@@ -44,4 +44,14 @@ class Broker(ABC):
 
     @abstractmethod
     def symbol_spec(self, symbol: str) -> dict: ...
+
+    def loss_at_stop(self, symbol: str, side: Side, volume: float, entry: float, stop_loss: float) -> float:
+        spec = self.symbol_spec(symbol)
+        return abs(entry - stop_loss) * volume * float(spec["contract_size"])
+
+    def normalize_protective_levels(self, symbol: str, side: Side, quote: Quote, stop_loss: float, take_profit: float) -> tuple[float, float]:
+        return stop_loss, take_profit
+
+    def is_owned_position(self, position: Position) -> bool:
+        return position.magic == 260115 or position.comment.startswith("GS:")
 

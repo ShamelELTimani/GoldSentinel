@@ -45,15 +45,36 @@ async def lifespan(_: FastAPI):
             await asyncio.sleep(
                 min(settings.news_refresh_seconds, settings.headline_refresh_seconds)
             )
+    async def management_loop() -> None:
+        while True:
+            try:
+                await asyncio.to_thread(service.manage_positions)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                repository.audit("POSITION_MANAGEMENT", "Background management failed", {"error": str(exc)}, "ERROR")
+            await asyncio.sleep(settings.position_manage_seconds)
+    async def history_refresh() -> None:
+        try:
+            await asyncio.to_thread(service.refresh_history)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            repository.audit("HISTORY", "Startup history refresh failed", {"error": str(exc)}, "ERROR")
     task = asyncio.create_task(scan_loop(), name="goldsentinel-scan-loop")
     news_task = asyncio.create_task(news_loop(), name="goldsentinel-news-loop")
+    management_task = asyncio.create_task(management_loop(), name="goldsentinel-position-management-loop")
+    history_task = asyncio.create_task(history_refresh(), name="goldsentinel-history-refresh") if settings.history_refresh_on_startup else None
     try:
         yield
     finally:
         task.cancel()
         news_task.cancel()
+        management_task.cancel()
+        if history_task and not history_task.done():
+            history_task.cancel()
         try:
-            await asyncio.gather(task, news_task)
+            await asyncio.gather(task, news_task, management_task, *([history_task] if history_task else []))
         except asyncio.CancelledError:
             pass
         service.stop()
@@ -114,6 +135,16 @@ def live_market(timeframe: Timeframe) -> dict:
 @app.get("/api/market-diagnostics")
 def market_diagnostics(count: int = Query(350, ge=50, le=5000)) -> dict:
     return service.market_diagnostics(count)
+
+
+@app.get("/api/market-context")
+def market_context() -> dict:
+    return service.market_context().model_dump()
+
+
+@app.post("/api/history/refresh")
+def refresh_history(_: None = Depends(require_token)) -> dict:
+    return service.refresh_history()
 
 
 @app.post("/api/analyze/{timeframe}")

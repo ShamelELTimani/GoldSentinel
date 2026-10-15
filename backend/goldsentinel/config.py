@@ -28,6 +28,15 @@ class Settings(BaseSettings):
     news_refresh_seconds: int = Field(default=300, ge=60, le=3600)
     headline_refresh_seconds: int = Field(default=300, ge=60, le=3600)
     polling_seconds: float = Field(default=2.0, ge=0.5, le=60)
+    analysis_refresh_seconds: float = Field(default=10.0, ge=2, le=300)
+    position_manage_seconds: float = Field(default=5.0, ge=2, le=300)
+    history_batch_size: int = Field(default=5000, ge=100, le=10000)
+    history_refresh_on_startup: bool = False
+    history_m1_days: int = Field(default=14, ge=1, le=90)
+    history_m5_days: int = Field(default=120, ge=1, le=730)
+    history_m15_days: int = Field(default=180, ge=1, le=1095)
+    history_h1_days: int = Field(default=540, ge=1, le=3650)
+    history_h4_days: int = Field(default=1080, ge=1, le=7300)
 
     @model_validator(mode="after")
     def validate_calendar_window(self) -> "Settings":

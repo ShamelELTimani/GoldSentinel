@@ -42,6 +42,29 @@ class DecisionClass(str, Enum):
     operational = "OPERATIONAL"
 
 
+class SetupType(str, Enum):
+    zone_reversal = "ZONE_REVERSAL"
+    trend_continuation = "TREND_CONTINUATION"
+    pullback = "PULLBACK"
+    breakout_retest = "BREAKOUT_RETEST"
+
+
+class SetupState(str, Enum):
+    detected = "DETECTED"
+    qualified = "QUALIFIED"
+    submitting = "SUBMITTING"
+    filled = "FILLED"
+    rejected = "REJECTED"
+    uncertain = "UNCERTAIN"
+    expired = "EXPIRED"
+
+
+class ManagementAction(str, Enum):
+    hold = "HOLD"
+    modify_stop = "MODIFY_STOP"
+    close = "CLOSE"
+
+
 class Timeframe(str, Enum):
     m1 = "M1"
     m5 = "M5"
@@ -210,6 +233,11 @@ class TradeCandidate(BaseModel):
     spread_at_signal: float = 0
     max_price_deviation: float = 0
     evaluated_zones: int = 0
+    setup_type: SetupType | None = None
+    setup_fingerprint: str | None = None
+    entry_trigger: str | None = None
+    in_zone: bool | None = None
+    timeframe_context: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utcnow)
     expires_at: datetime
     status: str = "PROPOSED"
@@ -249,5 +277,64 @@ class Position(BaseModel):
     take_profit: float
     pnl: float = 0
     initial_risk: float = 0
+    magic: int = 0
+    comment: str = ""
+    setup_fingerprint: str | None = None
     opened_at: datetime = Field(default_factory=utcnow)
+
+
+class CandleAnalysis(BaseModel):
+    timeframe: Timeframe
+    timestamp: datetime
+    bias: str
+    regime: str
+    trend_strength: float = Field(ge=0, le=100)
+    momentum: str
+    volatility: str
+    patterns: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+    evidence_score: float = Field(ge=0, le=100)
+    invalidation: float | None = None
+    ema20: float
+    ema50: float
+    rsi: float
+    atr: float
+    swing_high: float | None = None
+    swing_low: float | None = None
+    bos: str | None = None
+    choch: str | None = None
+    liquidity_sweep: bool = False
+
+
+class MarketContext(BaseModel):
+    symbol: str
+    timestamp: datetime
+    regime: str
+    directional_bias: str
+    analyses: dict[str, CandleAnalysis]
+    reasons: list[str] = Field(default_factory=list)
+
+
+class TradeSetup(BaseModel):
+    fingerprint: str
+    setup_type: SetupType
+    side: Side
+    timeframe: Timeframe
+    trigger_timestamp: datetime
+    trigger: str
+    stop_loss: float
+    take_profit: float
+    evidence_score: float = Field(ge=0, le=100)
+    in_zone: bool
+    reasons: list[str] = Field(default_factory=list)
+    expires_at: datetime
+
+
+class PositionManagementDecision(BaseModel):
+    ticket: str
+    action: ManagementAction
+    reason: str
+    r_multiple: float
+    new_stop_loss: float | None = None
+    close_volume: float | None = None
 

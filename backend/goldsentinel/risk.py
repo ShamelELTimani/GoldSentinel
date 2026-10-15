@@ -41,7 +41,7 @@ class RiskManager:
             return RiskResult(allowed=False, reason="Adaptive risk budget is too small under current conditions", remaining_risk_pct=remaining)
         amount = account.equity * risk_pct / 100
         stop_distance = abs(request.entry - request.stop_loss)
-        loss_per_lot = stop_distance * spec["contract_size"]
+        loss_per_lot = float(spec.get("loss_per_lot") or stop_distance * spec["contract_size"])
         raw_volume = amount / loss_per_lot if loss_per_lot else 0
         step = float(spec["volume_step"])
         if step <= 0 or float(spec["contract_size"]) <= 0:

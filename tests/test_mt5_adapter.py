@@ -38,7 +38,7 @@ class FakeMT5:
         return SimpleNamespace(bid=2700.0, ask=2700.2, time_msc=int(broker_wall_time.timestamp() * 1000))
 
     def symbol_info(self, symbol):
-        return SimpleNamespace(filling_mode=1, trade_exemode=2, volume_min=0.01, volume_max=100.0, volume_step=0.01, trade_contract_size=100.0, trade_stops_level=10, point=0.01)
+        return SimpleNamespace(filling_mode=1, trade_exemode=2, volume_min=0.01, volume_max=100.0, volume_step=0.01, trade_contract_size=100.0, trade_stops_level=10, trade_freeze_level=5, trade_tick_size=0.05, digits=2, point=0.01)
 
     def copy_rates_from_pos(self, symbol, timeframe, offset, count):
         self.requested_timeframes.append(timeframe)
@@ -86,6 +86,19 @@ def test_mt5_filling_mode_uses_broker_flags_without_missing_constants(monkeypatc
     broker.connect()
     spec = broker.symbol_spec("XAUUSD.m")
     assert spec["filling_modes"] == ["FOK"]
+
+
+def test_mt5_protective_levels_round_outward_to_broker_tick(monkeypatch):
+    fake = FakeMT5()
+    monkeypatch.setitem(sys.modules, "MetaTrader5", fake)
+    from goldsentinel.brokers.mt5 import MT5Broker
+
+    broker = MT5Broker(); broker.connect()
+    quote = broker.quote("XAUUSD.m")
+    buy_sl, buy_tp = broker.normalize_protective_levels("XAUUSD.m", __import__('goldsentinel.domain', fromlist=['Side']).Side.buy, quote, 2699.98, 2701.02)
+    sell_sl, sell_tp = broker.normalize_protective_levels("XAUUSD.m", __import__('goldsentinel.domain', fromlist=['Side']).Side.sell, quote, 2701.02, 2699.98)
+    assert (buy_sl, buy_tp) == (2699.95, 2701.05)
+    assert (sell_sl, sell_tp) == (2701.05, 2699.95)
 
 
 def test_validator_ignores_expected_weekend_closure(candles):

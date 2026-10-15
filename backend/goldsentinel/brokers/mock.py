@@ -124,7 +124,7 @@ class MockBroker(Broker):
                 return BrokerResult(success=False, state="REJECTED", message="Invalid protective levels")
             ticket = str(uuid4().int)[:10]
             result = BrokerResult(success=True, state="FILLED", retcode=10009, message="Mock fill confirmed", order_ticket=ticket, deal_ticket=ticket, position_ticket=ticket, filled_volume=order.volume)
-            self._positions[ticket] = Position(ticket=ticket, symbol=symbol, side=order.side, volume=order.volume, entry=fill, current_price=fill, stop_loss=order.stop_loss, take_profit=order.take_profit, initial_risk=abs(fill - order.stop_loss) * order.volume * spec["contract_size"])
+            self._positions[ticket] = Position(ticket=ticket, symbol=symbol, side=order.side, volume=order.volume, entry=fill, current_price=fill, stop_loss=order.stop_loss, take_profit=order.take_profit, initial_risk=self.loss_at_stop(symbol, order.side, order.volume, fill, order.stop_loss), magic=260115, comment=f"GS:{order.client_order_id[:20]}")
             self._submitted[order.client_order_id] = result
             return result
 
@@ -134,11 +134,16 @@ class MockBroker(Broker):
             position = self._positions.get(ticket)
             if not position:
                 return BrokerResult(success=False, state="REJECTED", message="Position not found")
+            quote = self.quote(position.symbol)
+            exit_price = quote.bid if position.side == Side.buy else quote.ask
+            direction = 1 if position.side == Side.buy else -1
+            close_volume = volume or position.volume
+            realized = (exit_price - position.entry) * direction * close_volume * 100
             if volume and volume < position.volume:
                 position.volume = round(position.volume - volume, 2)
             else:
                 del self._positions[ticket]
-            return BrokerResult(success=True, state="FILLED", message="Position close confirmed", position_ticket=ticket, filled_volume=volume or position.volume)
+            return BrokerResult(success=True, state="FILLED", message="Position close confirmed", position_ticket=ticket, filled_volume=close_volume, raw={"exit_price": exit_price, "realized_pnl": round(realized, 2), "commission": 0, "swap": 0})
 
     def modify_position(self, ticket: str, stop_loss: float, take_profit: float) -> BrokerResult:
         self._require()
@@ -161,5 +166,5 @@ class MockBroker(Broker):
         return BrokerResult(success=True, state="CANCELLED", message="Pending order cancellation confirmed", order_ticket=ticket)
 
     def symbol_spec(self, symbol: str) -> dict:
-        return {"volume_min": 0.01, "volume_max": 100.0, "volume_step": 0.01, "contract_size": 100.0, "trade_stops_level": 10, "point": 0.01, "filling_modes": ["FOK", "IOC", "RETURN"]}
+        return {"volume_min": 0.01, "volume_max": 100.0, "volume_step": 0.01, "contract_size": 100.0, "trade_stops_level": 10, "trade_freeze_level": 0, "trade_tick_size": 0.01, "digits": 2, "point": 0.01, "filling_modes": ["FOK", "IOC", "RETURN"]}
 

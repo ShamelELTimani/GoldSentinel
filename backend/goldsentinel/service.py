@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import RLock
 
 from .backtest import BacktestConfig, run_backtest, walk_forward
@@ -8,11 +8,15 @@ from .brokers.base import Broker
 from .brokers.mock import MockBroker
 from .config import Settings
 from .database import Repository
-from .domain import AccountSnapshot, DecisionAction, DecisionClass, Position, Quote, RuntimeSettings, StrategyProfile, Timeframe, TradeCandidate, TradingMode
+from .domain import AccountSnapshot, DecisionAction, DecisionClass, MarketContext, Position, Quote, RuntimeSettings, StrategyProfile, Timeframe, TradeCandidate, TradingMode
 from .execution import ExecutionManager
+from .historical_data import HistoricalDataPipeline
 from .market import indicators, validate_candles
+from .market_context import CONTEXT_FRAMES, MarketContextEngine
 from .news import NewsEngine
+from .position_manager import PositionManager
 from .risk import RiskManager
+from .setups import SetupEngine
 from .strategy import StrategyEngine
 from .zones import detect_zones, structure_summary
 
@@ -27,12 +31,23 @@ class GoldSentinelService:
         self.news = NewsEngine(settings)
         self.strategy = StrategyEngine(self.risk)
         self.execution = ExecutionManager(self.broker, self.repository)
+        self.context_engine = MarketContextEngine()
+        self.setup_engine = SetupEngine()
+        self.position_manager = PositionManager(self.broker, self.repository)
+        self.history = HistoricalDataPipeline(self.broker, self.repository, settings.symbol, settings.history_batch_size)
         self.candidates: dict[str, TradeCandidate] = {}
         self.latest_candidate: TradeCandidate | None = None
         self.market_qualities: dict[Timeframe, dict] = {}
         self.last_quote: Quote | None = None
         self.last_account: AccountSnapshot | None = None
         self.last_positions: list[Position] = []
+        self.latest_context: MarketContext | None = None
+        self.detected_setups = []
+        self.management_decisions = []
+        self.context_qualities: dict[str, dict] = {}
+        self._context_refreshed_at: datetime | None = None
+        self._last_signal_signature: str | None = None
+        self._last_signal_audit_at: datetime | None = None
         self._lock = RLock()
 
     def _make_broker(self) -> Broker:
@@ -79,7 +94,7 @@ class GoldSentinelService:
                     raise ValueError("Trading is paused; press Resume before arming")
                 if self.runtime.mode != TradingMode.full_auto:
                     raise ValueError("Automatic execution can only be armed in FULL_AUTO mode")
-                self.market_snapshot(Timeframe.m15)
+                self.market_context(force=True)
                 quote = self.broker.quote(self.settings.symbol)
                 account = self.broker.account()
                 positions = self.broker.positions(self.settings.symbol)
@@ -141,18 +156,74 @@ class GoldSentinelService:
         candles = self.broker.candles(self.settings.symbol, timeframe, 2)
         return {"symbol": self.settings.symbol, "timeframe": timeframe, "candles": candles, **self.quote_snapshot()}
 
+    def market_context(self, force: bool = False) -> MarketContext:
+        now = datetime.now(timezone.utc)
+        if (
+            not force
+            and self.latest_context is not None
+            and self._context_refreshed_at is not None
+            and (now - self._context_refreshed_at).total_seconds() < self.settings.analysis_refresh_seconds
+        ):
+            return self.latest_context
+        candles_by_timeframe = {}
+        errors = []
+        for frame in CONTEXT_FRAMES:
+            candles = self.broker.candles(self.settings.symbol, frame, 260)
+            quality = validate_candles(candles, frame)
+            self.market_qualities[frame] = quality.__dict__
+            self.context_qualities[frame.value] = quality.__dict__
+            if not quality.valid:
+                errors.extend(f"{frame.value}: {item}" for item in (quality.errors or ["market data invalid"]))
+            candles_by_timeframe[frame] = candles
+        if errors:
+            raise ValueError("; ".join(errors))
+        self.latest_context = self.context_engine.build(self.settings.symbol, candles_by_timeframe)
+        self._context_refreshed_at = now
+        return self.latest_context
+
     def analyze(self, timeframe: Timeframe = Timeframe.m15) -> TradeCandidate:
-        snapshot = self.market_snapshot(timeframe)
-        if not snapshot["quality"]["valid"]:
-            reasons = snapshot["quality"]["errors"] or ["Recent unexpected market-data gap detected"]
-            candidate = self.strategy._no_trade(self.settings.symbol, timeframe, snapshot["candles"][-1].close, reasons, DecisionClass.operational, reasons)
-        else:
-            news = self.news.risk_context(policy=self.runtime.risk.news_policy)
-            quote = self._quote()
-            candidate = self.strategy.evaluate(self.settings.symbol, timeframe, snapshot["candles"], snapshot["zones"], quote, self.broker.account(), self.broker.positions(self.settings.symbol), self.runtime.risk, self.runtime.strategy_profile, self.broker.symbol_spec(self.settings.symbol), news)
+        quote = self._quote()
+        try:
+            context = self.market_context()
+            zone_candles = self.broker.candles(self.settings.symbol, Timeframe.m15, 350)
+            zones = detect_zones(zone_candles, Timeframe.m15)
+            self.detected_setups = self.setup_engine.detect(context, quote, zones, self.runtime.strategy_profile)
+            if not self.detected_setups:
+                candidate = self.strategy._no_trade(
+                    self.settings.symbol,
+                    Timeframe.m5,
+                    (quote.bid + quote.ask) / 2,
+                    [*context.reasons, "No candle-confirmed setup met the active profile threshold"],
+                    DecisionClass.market,
+                )
+            else:
+                account = self.broker.account()
+                positions = self.broker.positions(self.settings.symbol)
+                spec = self.broker.symbol_spec(self.settings.symbol)
+                circuit = self.repository.risk_circuit_state(account, self.runtime.risk.cooldown_minutes) if hasattr(self.repository, "risk_circuit_state") else {}
+                news = self.news.risk_context(policy=self.runtime.risk.news_policy)
+                candidates = []
+                for setup in self.detected_setups:
+                    setup_spec = {**spec, **circuit, "loss_per_lot": self.broker.loss_at_stop(self.settings.symbol, setup.side, 1.0, quote.ask if setup.side.value == "BUY" else quote.bid, setup.stop_loss)}
+                    evaluated = self.strategy.evaluate_setup(
+                        self.settings.symbol, setup, quote, account, positions, self.runtime.risk,
+                        self.runtime.strategy_profile, setup_spec, news, context.model_dump(mode="json"),
+                    )
+                    if evaluated.action == DecisionAction.no_trade:
+                        evaluated.setup_type = setup.setup_type
+                        evaluated.setup_fingerprint = setup.fingerprint
+                        evaluated.entry_trigger = setup.trigger
+                        evaluated.in_zone = setup.in_zone
+                        evaluated.timeframe_context = context.model_dump(mode="json")
+                    candidates.append(evaluated)
+                    self._record_setup_detection(evaluated)
+                candidate = next((item for item in candidates if item.action != DecisionAction.no_trade), candidates[0])
+        except Exception as exc:
+            reason = f"Multi-timeframe market context unavailable: {exc}"
+            candidate = self.strategy._no_trade(self.settings.symbol, timeframe, (quote.bid + quote.ask) / 2, [reason], DecisionClass.operational, [reason])
         self.candidates[candidate.id] = candidate
         self.latest_candidate = candidate
-        self.repository.audit("SIGNAL", candidate.action.value, candidate.model_dump())
+        self._audit_signal(candidate)
         if candidate.action != DecisionAction.no_trade:
             quote = self.broker.quote(self.settings.symbol)
             account = self.broker.account()
@@ -161,11 +232,50 @@ class GoldSentinelService:
             active = [item["detail"] for item in readiness["checks"] if item["blocking"]]
             candidate.blockers = list(dict.fromkeys(candidate.blockers + active))
             if self.runtime.mode == TradingMode.full_auto and readiness["ready"]:
-                result = self.execution.execute_candidate(candidate, self.runtime, f"auto:{candidate.zone_id or candidate.id}")
+                result = self.execution.execute_candidate(candidate, self.runtime, f"auto:{candidate.setup_fingerprint or candidate.zone_id or candidate.id}")
                 candidate.status = "EXECUTED" if result.success else result.state
             elif self.runtime.mode == TradingMode.full_auto:
                 candidate.status = "BLOCKED_OPERATIONAL"
         return candidate
+
+    def _record_setup_detection(self, candidate: TradeCandidate) -> None:
+        if not candidate.setup_fingerprint or not hasattr(self.repository, "setup_lifecycle"):
+            return
+        existing = self.repository.setup_lifecycle(candidate.setup_fingerprint)
+        if existing and existing["state"] in {"SUBMITTING", "FILLED", "UNCERTAIN"}:
+            return
+        state = "QUALIFIED" if candidate.action != DecisionAction.no_trade else "DETECTED"
+        self.repository.save_setup_lifecycle(candidate.setup_fingerprint, state, candidate.id, detail=candidate.status, payload={"setup_type": candidate.setup_type.value if candidate.setup_type else None})
+
+    def _audit_signal(self, candidate: TradeCandidate) -> None:
+        signature = "|".join([candidate.action.value, candidate.decision_class.value, candidate.setup_fingerprint or "", candidate.status, *candidate.blockers])
+        now = datetime.now(timezone.utc)
+        if signature != self._last_signal_signature or not self._last_signal_audit_at or now - self._last_signal_audit_at >= timedelta(minutes=1):
+            self.repository.audit("SIGNAL", candidate.action.value, candidate.model_dump())
+            self._last_signal_signature = signature
+            self._last_signal_audit_at = now
+
+    def manage_positions(self) -> list:
+        try:
+            context = self.market_context()
+            zone_candles = self.broker.candles(self.settings.symbol, Timeframe.m15, 250)
+            zones = detect_zones(zone_candles, Timeframe.m15)
+            news = self.news.risk_context(policy=self.runtime.risk.news_policy)
+            self.management_decisions = self.position_manager.manage(self.settings.symbol, self.runtime, context, zones, news)
+        except Exception as exc:
+            self.repository.audit("POSITION_MANAGEMENT", "Management cycle unavailable", {"error": str(exc)}, "WARNING")
+            self.management_decisions = []
+        return self.management_decisions
+
+    def refresh_history(self) -> dict:
+        plan = {
+            Timeframe.m1: self.settings.history_m1_days,
+            Timeframe.m5: self.settings.history_m5_days,
+            Timeframe.m15: self.settings.history_m15_days,
+            Timeframe.h1: self.settings.history_h1_days,
+            Timeframe.h4: self.settings.history_h4_days,
+        }
+        return self.history.refresh_core(plan)
 
     def market_diagnostics(self, count: int = 350) -> dict:
         results = {}
@@ -225,10 +335,10 @@ class GoldSentinelService:
             )
         open_risk = sum(item.initial_risk for item in positions)
         readiness = self._readiness(quote, account, positions)
-        return {"connected": quote_health["connected"], "broker": self.settings.broker.upper(), "symbol": self.settings.symbol, "data_source": quote.source, "quote": quote, "quote_health": {key: value for key, value in quote_health.items() if key != "quote"}, "spread": quote.spread, "account": account, "runtime": self.runtime, "positions": positions, "pending_orders": pending_orders, "open_risk": round(open_risk, 2), "remaining_risk": round(max(0, account.equity * self.runtime.risk.max_combined_risk_pct / 100 - open_risk), 2), "latest_candidate": self.latest_candidate, "readiness": readiness, "server_time": datetime.now(timezone.utc), "news": self.news.status(self.runtime.risk.news_policy)}
+        return {"connected": quote_health["connected"], "broker": self.settings.broker.upper(), "symbol": self.settings.symbol, "data_source": quote.source, "quote": quote, "quote_health": {key: value for key, value in quote_health.items() if key != "quote"}, "spread": quote.spread, "account": account, "runtime": self.runtime, "positions": positions, "pending_orders": pending_orders, "open_risk": round(open_risk, 2), "remaining_risk": round(max(0, account.equity * self.runtime.risk.max_combined_risk_pct / 100 - open_risk), 2), "latest_candidate": self.latest_candidate, "market_context": self.latest_context, "detected_setups": self.detected_setups, "position_management": self.management_decisions, "readiness": readiness, "server_time": datetime.now(timezone.utc), "news": self.news.status(self.runtime.risk.news_policy)}
 
     def _readiness(self, quote, account, positions) -> dict:
-        quality = self.market_qualities.get(Timeframe.m15)
+        context_ready = all(self.market_qualities.get(frame, {}).get("valid") for frame in CONTEXT_FRAMES)
         news = self.news.risk_context(policy=self.runtime.risk.news_policy)
         combined_limit = account.equity * self.runtime.risk.max_combined_risk_pct / 100
         open_risk = sum(max(position.initial_risk, 0) for position in positions)
@@ -239,7 +349,7 @@ class GoldSentinelService:
             broker_connected = False
         checks = [
             {"id": "mt5_connection", "label": "MT5 connection", "ready": broker_connected and account.is_demo and quote.source == broker_expected, "detail": f"Connected to {quote.source} demo account" if broker_connected and account.is_demo and quote.source == broker_expected else "MT5 demo connection or broker data source is not verified"},
-            {"id": "market_data", "label": "Market data", "ready": bool(quality and quality["valid"]), "detail": "M15 candles are fresh and structurally valid" if quality and quality["valid"] else "M15 market data has not validated or has a recent blocking issue"},
+            {"id": "market_data", "label": "Market data", "ready": context_ready, "detail": "H4/H1/M15/M5/M1 candles are fresh and structurally valid" if context_ready else "Required multi-timeframe market data has not validated or has a recent blocking issue"},
             {"id": "news", "label": "News availability", "ready": not news["block"], "detail": news["reason"]},
             {"id": "risk", "label": "Risk limits", "ready": len(positions) < self.runtime.risk.max_positions and open_risk < combined_limit, "detail": "Position count and combined open risk are within limits" if len(positions) < self.runtime.risk.max_positions and open_risk < combined_limit else "Position count or combined open-risk limit is reached"},
             {"id": "mode", "label": "Execution mode", "ready": self.runtime.mode == TradingMode.full_auto, "detail": "FULL_AUTO mode selected" if self.runtime.mode == TradingMode.full_auto else f"{self.runtime.mode.value} mode does not submit automatic orders"},

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 
 from .brokers.base import Broker
@@ -33,17 +33,23 @@ class ExecutionManager:
             if idempotency_key in self._results:
                 return self._results[idempotency_key]
             if idempotency_key in self._uncertain:
-                return BrokerResult(
-                    success=False,
-                    state="UNCERTAIN",
-                    message="Submission is quarantined pending broker reconciliation",
-                )
+                reconciled = self._reconcile(candidate, idempotency_key)
+                if reconciled:
+                    return reconciled
+                return BrokerResult(success=False, state="UNCERTAIN", message="Submission is quarantined pending broker reconciliation")
+            persisted = self._persistent_guard(candidate, idempotency_key)
+            if persisted:
+                return persisted
             rejection = self._safety_preflight(candidate, runtime)
             if rejection:
-                return self._reject(candidate, rejection)
+                if "expired" in rejection.lower():
+                    self._save_lifecycle(candidate, "EXPIRED", rejection)
+                return self._reject(candidate, rejection, persist=False)
             order, rejection = self._reprice_and_resize(candidate, runtime, idempotency_key)
             if rejection or order is None:
                 return self._reject(candidate, rejection or "Trade revalidation failed")
+
+            self._save_lifecycle(candidate, "SUBMITTING", "Order submission started", increment_attempt=True)
 
             self.repository.audit(
                 "ORDER_SUBMITTING",
@@ -61,8 +67,23 @@ class ExecutionManager:
                 )
             if result.state == "UNCERTAIN":
                 self._uncertain.add(idempotency_key)
-            else:
+                reconciled = self._reconcile(candidate, idempotency_key)
+                if reconciled:
+                    result = reconciled
+                else:
+                    self._save_lifecycle(candidate, "UNCERTAIN", result.message, payload=result.model_dump())
+            elif result.success:
                 self._results[idempotency_key] = result
+                self._save_lifecycle(candidate, "FILLED", result.message, result.position_ticket, result.model_dump())
+                self._record_trade(result, candidate)
+            else:
+                self._save_lifecycle(
+                    candidate,
+                    "REJECTED",
+                    result.message,
+                    payload=result.model_dump(),
+                    retry_after=datetime.now(timezone.utc) + timedelta(seconds=120),
+                )
             self.repository.audit(
                 "ORDER_RESULT",
                 result.message,
@@ -71,11 +92,93 @@ class ExecutionManager:
             )
             return result
 
-    def _reject(self, candidate: TradeCandidate, message: str) -> BrokerResult:
+    def _reject(self, candidate: TradeCandidate, message: str, persist: bool = True) -> BrokerResult:
         self.repository.audit(
             "ORDER_REJECTED", message, {"candidate_id": candidate.id}, "WARNING"
         )
-        return BrokerResult(success=False, state="REJECTED", message=message)
+        result = BrokerResult(success=False, state="REJECTED", message=message)
+        if persist:
+            self._save_lifecycle(candidate, "REJECTED", message, payload=result.model_dump(), retry_after=datetime.now(timezone.utc) + timedelta(seconds=120))
+        return result
+
+    def _persistent_guard(self, candidate: TradeCandidate, idempotency_key: str) -> BrokerResult | None:
+        fingerprint = candidate.setup_fingerprint
+        if not fingerprint or not hasattr(self.repository, "setup_lifecycle"):
+            return None
+        record = self.repository.setup_lifecycle(fingerprint)
+        if not record:
+            return None
+        state = record["state"]
+        if state == "FILLED":
+            return BrokerResult(success=True, state="FILLED", message="Setup was already filled; duplicate submission suppressed", position_ticket=record.get("broker_ticket"))
+        if state in {"SUBMITTING", "UNCERTAIN"}:
+            reconciled = self._reconcile(candidate, idempotency_key)
+            if reconciled:
+                return reconciled
+            return BrokerResult(success=False, state="UNCERTAIN", message="Setup has an unresolved broker submission; duplicate submission suppressed")
+        retry_after = record.get("retry_after")
+        if state == "REJECTED" and retry_after:
+            if retry_after.tzinfo is None:
+                retry_after = retry_after.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) < retry_after:
+                return BrokerResult(success=False, state="REJECTED", message=f"Setup retry cooling down after rejection: {record.get('detail', '')}")
+        return None
+
+    def _save_lifecycle(
+        self,
+        candidate: TradeCandidate,
+        state: str,
+        detail: str,
+        broker_ticket: str | None = None,
+        payload: dict | None = None,
+        retry_after: datetime | None = None,
+        increment_attempt: bool = False,
+    ) -> None:
+        if candidate.setup_fingerprint and hasattr(self.repository, "save_setup_lifecycle"):
+            self.repository.save_setup_lifecycle(
+                candidate.setup_fingerprint,
+                state,
+                candidate.id,
+                broker_ticket,
+                detail,
+                payload,
+                retry_after,
+                increment_attempt,
+            )
+
+    def _record_trade(self, result: BrokerResult, candidate: TradeCandidate) -> None:
+        ticket = result.position_ticket or result.order_ticket
+        if ticket and hasattr(self.repository, "record_trade_lifecycle"):
+            self.repository.record_trade_lifecycle(ticket, candidate, candidate.entry)
+
+    def _reconcile(self, candidate: TradeCandidate, idempotency_key: str) -> BrokerResult | None:
+        try:
+            marker = f"GS:{idempotency_key[:20]}"
+            match = next(
+                (
+                    position
+                    for position in self.broker.positions(candidate.symbol)
+                    if self.broker.is_owned_position(position) and (position.comment == marker or position.setup_fingerprint == candidate.setup_fingerprint)
+                ),
+                None,
+            )
+        except Exception:
+            return None
+        if not match:
+            return None
+        result = BrokerResult(
+            success=True,
+            state="FILLED",
+            message="Broker position reconciled after an uncertain submission",
+            position_ticket=match.ticket,
+            filled_volume=match.volume,
+            raw={"reconciled": True},
+        )
+        self._uncertain.discard(idempotency_key)
+        self._results[idempotency_key] = result
+        self._save_lifecycle(candidate, "FILLED", result.message, match.ticket, result.model_dump())
+        self._record_trade(result, candidate)
+        return result
 
     def _safety_preflight(
         self, candidate: TradeCandidate, runtime: RuntimeSettings
@@ -105,7 +208,7 @@ class ExecutionManager:
 
         spec = self.broker.symbol_spec(candidate.symbol)
         point = float(spec.get("point", 0.01))
-        min_stop = float(spec.get("trade_stops_level", 0)) * point
+        min_stop = max(float(spec.get("trade_stops_level", 0)), float(spec.get("trade_freeze_level", 0))) * point
         side = Side(candidate.action.value)
         price = quote.ask if side == Side.buy else quote.bid
         allowed_drift = candidate.max_price_deviation or max(quote.spread * 2, point * 20)
@@ -119,12 +222,16 @@ class ExecutionManager:
         if quote.spread > spread_limit:
             return None, f"Spread widened to {quote.spread:.2f}, above the {spread_limit:.2f} limit"
 
+        stop_loss, take_profit = self.broker.normalize_protective_levels(
+            candidate.symbol, side, quote, candidate.stop_loss, candidate.take_profit
+        )
+        trigger = quote.bid if side == Side.buy else quote.ask
         if side == Side.buy:
-            stop_distance = price - candidate.stop_loss
-            target_distance = candidate.take_profit - price
+            stop_distance = trigger - stop_loss
+            target_distance = take_profit - trigger
         else:
-            stop_distance = candidate.stop_loss - price
-            target_distance = price - candidate.take_profit
+            stop_distance = stop_loss - trigger
+            target_distance = trigger - take_profit
         if stop_distance <= 0 or target_distance <= 0:
             return None, "Fresh executable price invalidates stop-loss or take-profit direction"
         if min(stop_distance, target_distance) < min_stop:
@@ -137,11 +244,13 @@ class ExecutionManager:
             )
 
         positions = self.broker.positions(candidate.symbol)
+        circuit = self.repository.risk_circuit_state(account, runtime.risk.cooldown_minutes) if hasattr(self.repository, "risk_circuit_state") else {}
+        spec = {**spec, **circuit, "loss_per_lot": self.broker.loss_at_stop(candidate.symbol, side, 1.0, price, stop_loss)}
         risk = self.risk.calculate(
             RiskRequest(
                 side=side,
                 entry=price,
-                stop_loss=candidate.stop_loss,
+                stop_loss=stop_loss,
                 quality_score=min(candidate.quality_score, 100),
             ),
             account,
@@ -149,6 +258,8 @@ class ExecutionManager:
             runtime.strategy_profile,
             spec,
             positions,
+            float(spec.get("daily_drawdown_pct", 0)),
+            int(spec.get("consecutive_losses", 0)),
         )
         if not risk.allowed:
             return None, f"Fresh risk calculation rejected the order: {risk.reason}"
@@ -156,6 +267,8 @@ class ExecutionManager:
             return None, "Fresh order exceeds the current per-trade risk limit"
 
         candidate.entry = round(price, 5)
+        candidate.stop_loss = stop_loss
+        candidate.take_profit = take_profit
         candidate.volume = risk.volume
         candidate.risk_amount = risk.risk_amount
         candidate.risk_pct = risk.risk_pct
@@ -166,8 +279,8 @@ class ExecutionManager:
                 side=side,
                 volume=risk.volume,
                 entry=price,
-                stop_loss=candidate.stop_loss,
-                take_profit=candidate.take_profit,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
                 client_order_id=idempotency_key,
                 candidate_id=candidate.id,
                 max_price_deviation=allowed_drift,
