@@ -111,6 +111,17 @@ class MockBroker(Broker):
                 return BrokerResult(success=False, state="REJECTED", retcode=10014, message="Invalid volume")
             quote = self.quote(symbol)
             fill = quote.ask if order.side == Side.buy else quote.bid
+            if order.max_price_deviation is not None and abs(fill - order.entry) > order.max_price_deviation:
+                return BrokerResult(success=False, state="REJECTED", message="Executable price moved beyond the approved slippage limit")
+            minimum = spec["trade_stops_level"] * spec["point"]
+            if order.side == Side.buy:
+                valid = order.stop_loss < fill < order.take_profit
+                distances = (fill - order.stop_loss, order.take_profit - fill)
+            else:
+                valid = order.take_profit < fill < order.stop_loss
+                distances = (order.stop_loss - fill, fill - order.take_profit)
+            if not valid or min(distances) < minimum:
+                return BrokerResult(success=False, state="REJECTED", message="Invalid protective levels")
             ticket = str(uuid4().int)[:10]
             result = BrokerResult(success=True, state="FILLED", retcode=10009, message="Mock fill confirmed", order_ticket=ticket, deal_ticket=ticket, position_ticket=ticket, filled_volume=order.volume)
             self._positions[ticket] = Position(ticket=ticket, symbol=symbol, side=order.side, volume=order.volume, entry=fill, current_price=fill, stop_loss=order.stop_loss, take_profit=order.take_profit, initial_risk=abs(fill - order.stop_loss) * order.volume * spec["contract_size"])

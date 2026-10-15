@@ -207,6 +207,9 @@ class TradeCandidate(BaseModel):
     rationale: list[str]
     decision_class: DecisionClass = DecisionClass.trade
     blockers: list[str] = Field(default_factory=list)
+    spread_at_signal: float = 0
+    max_price_deviation: float = 0
+    evaluated_zones: int = 0
     created_at: datetime = Field(default_factory=utcnow)
     expires_at: datetime
     status: str = "PROPOSED"
@@ -220,6 +223,7 @@ class OrderRequest(BaseModel):
     take_profit: float
     client_order_id: str = Field(default_factory=lambda: str(uuid4()))
     candidate_id: str | None = None
+    max_price_deviation: float | None = Field(default=None, gt=0)
 
 
 class BrokerResult(BaseModel):

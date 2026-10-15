@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from .domain import AccountSnapshot, Position, RiskRequest, RiskResult, RiskSettings, StrategyProfile
+from .domain import AccountSnapshot, Position, RiskRequest, RiskResult, RiskSettings, Side, StrategyProfile
 
 
 PROFILE_FACTOR = {
@@ -14,8 +14,12 @@ PROFILE_FACTOR = {
 
 class RiskManager:
     def calculate(self, request: RiskRequest, account: AccountSnapshot, settings: RiskSettings, profile: StrategyProfile, spec: dict, positions: list[Position], daily_drawdown_pct: float = 0, consecutive_losses: int = 0) -> RiskResult:
-        if request.entry == request.stop_loss:
-            return RiskResult(allowed=False, reason="Stop loss must differ from entry")
+        if account.equity <= 0:
+            return RiskResult(allowed=False, reason="Account equity must be positive")
+        if request.side == Side.buy and request.stop_loss >= request.entry:
+            return RiskResult(allowed=False, reason="BUY stop loss must be below executable entry")
+        if request.side == Side.sell and request.stop_loss <= request.entry:
+            return RiskResult(allowed=False, reason="SELL stop loss must be above executable entry")
         if daily_drawdown_pct >= settings.daily_drawdown_stop_pct:
             return RiskResult(allowed=False, reason="Daily equity drawdown circuit breaker is active")
         if consecutive_losses >= settings.consecutive_loss_limit:
@@ -39,7 +43,9 @@ class RiskManager:
         stop_distance = abs(request.entry - request.stop_loss)
         loss_per_lot = stop_distance * spec["contract_size"]
         raw_volume = amount / loss_per_lot if loss_per_lot else 0
-        step = spec["volume_step"]
+        step = float(spec["volume_step"])
+        if step <= 0 or float(spec["contract_size"]) <= 0:
+            return RiskResult(allowed=False, reason="Broker volume or contract specification is invalid")
         volume = math.floor(raw_volume / step + 1e-9) * step
         volume = round(min(volume, spec["volume_max"]), 8)
         if volume < spec["volume_min"]:
