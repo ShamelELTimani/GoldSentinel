@@ -1,21 +1,21 @@
 GOLDSENTINEL READ-ONLY MONITOR — LATEST REPORT
-Generated UTC: 2026-10-15T18:22:45+00:00
+Generated UTC: 2026-10-15T18:32:05+00:00
 Monitoring started UTC: 2026-10-15T18:21:35+00:00
 API: http://127.0.0.1:8000 (local GET requests only)
-Samples collected: 8; market scans: 2
+Samples collected: 64; market scans: 11
 Last API error: none
 
 BROKER & PRICES
 Broker: MT5 | symbol: XAUUSD.m | connected: True
-Bid/Ask: 4157.1 / 4157.36 | quote timestamp: 2026-10-15T18:22:45.724000Z
-Quote age: 0.060593 seconds (old ticks are possible during market closures)
-Observed price changes since start: 7; quote timestamp changes: 7
-Most recent observed price change: 2026-10-15T18:22:45+00:00
+Bid/Ask: 4156.77 / 4157.03 | quote timestamp: 2026-10-15T18:32:05.637000Z
+Quote age: 0.302508 seconds (old ticks are possible during market closures)
+Observed price changes since start: 63; quote timestamp changes: 63
+Most recent observed price change: 2026-10-15T18:32:05+00:00
 Equity: 212.57 | DEMO: True
 
 SAFETY & RISK
-Runtime: {'mode': 'FULL_AUTO', 'strategy_profile': 'BALANCED', 'risk': {'max_risk_per_trade_pct': 5.0, 'max_combined_risk_pct': 6.0, 'max_positions': 10, 'daily_drawdown_stop_pct': 6.0, 'consecutive_loss_limit': 4, 'cooldown_minutes': 60, 'preferred_min_rr': 1.5, 'news_policy': 'BALANCED'}, 'paused': False, 'emergency_stop': False, 'armed': False}
-Readiness: False | blockers: ['Automatic order submission is disarmed']
+Runtime: {'mode': 'FULL_AUTO', 'strategy_profile': 'BALANCED', 'risk': {'max_risk_per_trade_pct': 5.0, 'max_combined_risk_pct': 6.0, 'max_positions': 10, 'daily_drawdown_stop_pct': 6.0, 'consecutive_loss_limit': 4, 'cooldown_minutes': 60, 'preferred_min_rr': 1.5, 'news_policy': 'BALANCED'}, 'paused': False, 'emergency_stop': False, 'armed': True}
+Readiness: True | blockers: []
 Open positions: 0 | pending orders: 0
 Backend reported open risk: 0 (may be understated for MT5 positions)
 Independent APPROXIMATE stop-based open risk: 0.00 USD
@@ -23,30 +23,30 @@ Risk estimate incomplete because of missing/invalid SL: False
 Per-trade max risk: 5.0% | combined max risk: 6.0%
 
 DECISIONS & ORDERS
-Latest decision: SELL / TRADE / BLOCKED_OPERATIONAL
-Latest rationale: Risk fits per-trade, combined exposure, volume, and circuit-breaker limits
-Audit signal count since monitoring began: 35
-BUY signals: 0; SELL signals: 35; NO_TRADE: 0
-Order submissions: 0 | order results: 0 | preflight rejections: 0
+Latest decision: NO_TRADE / MARKET / REJECTED
+Latest rationale: 2 additional zone rejection(s)
+Audit signal count since monitoring began: 305
+BUY signals: 0; SELL signals: 231; NO_TRADE: 74
+Order submissions: 1 | order results: 1 | preflight rejections: 0
 Top NO_TRADE explanations (since monitoring started):
-  None captured yet
+     74  2 additional zone rejection(s)
 
 M15 ZONES & MARKET QUALITY
 Market quality: True | structure: BEARISH
-ATR: 6.696037888516961
-  BUY 4096.61-4098.58 raw_score=72.9 touches=0
-  BUY 4136.27-4140.27 raw_score=66.0 touches=12
-  SELL 4150.29-4155.66 raw_score=63.4 touches=46
-  SELL 4156.43-4168.55 raw_score=56.2 touches=10
-  SELL 4158.2-4161.69 raw_score=54.3 touches=19
-  SELL 4156.45-4159.24 raw_score=54.2 touches=15
-  BUY 4143.7-4145.9 raw_score=50.1 touches=2
-  SELL 4157.57-4160.49 raw_score=50.0 touches=16
+ATR: 6.4274433453878945
+  BUY 4096.61-4098.53 raw_score=73.1 touches=0
+  BUY 4136.27-4140.22 raw_score=66.8 touches=12
+  SELL 4156.48-4168.55 raw_score=56.6 touches=11
+  SELL 4156.5-4159.24 raw_score=55.0 touches=16
+  SELL 4158.25-4161.69 raw_score=54.8 touches=20
+  BUY 4129.27-4147.35 raw_score=50.5 touches=9
+  SELL 4157.62-4160.49 raw_score=50.2 touches=17
+  BUY 4143.7-4145.85 raw_score=50.2 touches=2
 
 NEWS
-Calendar: RATE_LIMITED | error: Calendar provider rate limit reached; refresh is deferred
-Events: 0 | headlines: 47
-Headline error: None | news restriction: UNAVAILABLE
+Calendar: AVAILABLE | error: None
+Events: 22 | headlines: 47
+Headline error: None | news restriction: NORMAL
 
 NOTES
 - This script only monitors API data, it does not place trades or change settings.
