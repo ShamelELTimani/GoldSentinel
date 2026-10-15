@@ -5,42 +5,81 @@ from threading import Lock
 
 from .brokers.base import Broker
 from .database import Repository
-from .domain import BrokerResult, DecisionAction, OrderRequest, RuntimeSettings, Side, TradeCandidate
+from .domain import (
+    BrokerResult,
+    DecisionAction,
+    OrderRequest,
+    RiskRequest,
+    RuntimeSettings,
+    Side,
+    TradeCandidate,
+)
+from .risk import RiskManager
 
 
 class ExecutionManager:
     def __init__(self, broker: Broker, repository: Repository) -> None:
         self.broker = broker
         self.repository = repository
+        self.risk = RiskManager()
         self._lock = Lock()
         self._results: dict[str, BrokerResult] = {}
         self._uncertain: set[str] = set()
 
-    def execute_candidate(self, candidate: TradeCandidate, runtime: RuntimeSettings, idempotency_key: str) -> BrokerResult:
+    def execute_candidate(
+        self, candidate: TradeCandidate, runtime: RuntimeSettings, idempotency_key: str
+    ) -> BrokerResult:
         with self._lock:
             if idempotency_key in self._results:
                 return self._results[idempotency_key]
             if idempotency_key in self._uncertain:
-                return BrokerResult(success=False, state="UNCERTAIN", message="Submission is quarantined pending broker reconciliation")
-            rejection = self._preflight(candidate, runtime)
+                return BrokerResult(
+                    success=False,
+                    state="UNCERTAIN",
+                    message="Submission is quarantined pending broker reconciliation",
+                )
+            rejection = self._safety_preflight(candidate, runtime)
             if rejection:
-                self.repository.audit("ORDER_REJECTED", rejection, {"candidate_id": candidate.id}, "WARNING")
-                return BrokerResult(success=False, state="REJECTED", message=rejection)
-            self.repository.audit("ORDER_SUBMITTING", "Order passed application preflight", {"candidate_id": candidate.id, "key": idempotency_key})
-            order = OrderRequest(side=Side(candidate.action.value), volume=candidate.volume, entry=candidate.entry, stop_loss=candidate.stop_loss, take_profit=candidate.take_profit, client_order_id=idempotency_key, candidate_id=candidate.id)
+                return self._reject(candidate, rejection)
+            order, rejection = self._reprice_and_resize(candidate, runtime, idempotency_key)
+            if rejection or order is None:
+                return self._reject(candidate, rejection or "Trade revalidation failed")
+
+            self.repository.audit(
+                "ORDER_SUBMITTING",
+                "Order passed fresh-price, spread, stop, reward/risk, and exposure checks",
+                {"candidate_id": candidate.id, "key": idempotency_key, "entry": order.entry},
+            )
             try:
                 result = self.broker.submit_market_order(candidate.symbol, order)
             except Exception as exc:
                 self._uncertain.add(idempotency_key)
-                result = BrokerResult(success=False, state="UNCERTAIN", message=f"Broker response uncertain: {exc}")
+                result = BrokerResult(
+                    success=False,
+                    state="UNCERTAIN",
+                    message=f"Broker response uncertain: {exc}",
+                )
             if result.state == "UNCERTAIN":
                 self._uncertain.add(idempotency_key)
             else:
                 self._results[idempotency_key] = result
-            self.repository.audit("ORDER_RESULT", result.message, result.model_dump(), "INFO" if result.success else "ERROR")
+            self.repository.audit(
+                "ORDER_RESULT",
+                result.message,
+                result.model_dump(),
+                "INFO" if result.success else "ERROR",
+            )
             return result
 
-    def _preflight(self, candidate: TradeCandidate, runtime: RuntimeSettings) -> str | None:
+    def _reject(self, candidate: TradeCandidate, message: str) -> BrokerResult:
+        self.repository.audit(
+            "ORDER_REJECTED", message, {"candidate_id": candidate.id}, "WARNING"
+        )
+        return BrokerResult(success=False, state="REJECTED", message=message)
+
+    def _safety_preflight(
+        self, candidate: TradeCandidate, runtime: RuntimeSettings
+    ) -> str | None:
         if runtime.emergency_stop:
             return "Emergency stop is active"
         if runtime.paused:
@@ -51,10 +90,87 @@ class ExecutionManager:
             return "Candidate expired and must be revalidated"
         if not self.broker.is_connected():
             return "Broker is disconnected"
-        account = self.broker.account()
-        if not account.is_demo:
-            return "Actual MT5 account is not DEMO"
-        if candidate.risk_pct > runtime.risk.max_risk_per_trade_pct:
-            return "Candidate exceeds current per-trade risk limit"
         return None
 
+    def _reprice_and_resize(
+        self, candidate: TradeCandidate, runtime: RuntimeSettings, idempotency_key: str
+    ) -> tuple[OrderRequest | None, str | None]:
+        account = self.broker.account()
+        if not account.is_demo:
+            return None, "Actual MT5 account is not DEMO"
+        quote = self.broker.quote(candidate.symbol)
+        quote_age = max(0.0, (datetime.now(timezone.utc) - quote.timestamp).total_seconds())
+        if quote_age > 60:
+            return None, f"Executable quote is stale ({quote_age:.0f}s old)"
+
+        spec = self.broker.symbol_spec(candidate.symbol)
+        point = float(spec.get("point", 0.01))
+        min_stop = float(spec.get("trade_stops_level", 0)) * point
+        side = Side(candidate.action.value)
+        price = quote.ask if side == Side.buy else quote.bid
+        allowed_drift = candidate.max_price_deviation or max(quote.spread * 2, point * 20)
+        if abs(price - candidate.entry) > allowed_drift:
+            return None, (
+                f"Executable price moved {abs(price - candidate.entry):.2f}, beyond the "
+                f"allowed {allowed_drift:.2f}; fresh analysis is required"
+            )
+
+        spread_limit = max(candidate.spread_at_signal * 2.5, point * 50)
+        if quote.spread > spread_limit:
+            return None, f"Spread widened to {quote.spread:.2f}, above the {spread_limit:.2f} limit"
+
+        if side == Side.buy:
+            stop_distance = price - candidate.stop_loss
+            target_distance = candidate.take_profit - price
+        else:
+            stop_distance = candidate.stop_loss - price
+            target_distance = price - candidate.take_profit
+        if stop_distance <= 0 or target_distance <= 0:
+            return None, "Fresh executable price invalidates stop-loss or take-profit direction"
+        if min(stop_distance, target_distance) < min_stop:
+            return None, "Fresh executable price violates the broker minimum stop distance"
+        reward_risk = target_distance / stop_distance
+        if reward_risk < runtime.risk.preferred_min_rr:
+            return None, (
+                f"Fresh executable reward-to-risk {reward_risk:.2f} is below "
+                f"{runtime.risk.preferred_min_rr:.2f}"
+            )
+
+        positions = self.broker.positions(candidate.symbol)
+        risk = self.risk.calculate(
+            RiskRequest(
+                side=side,
+                entry=price,
+                stop_loss=candidate.stop_loss,
+                quality_score=min(candidate.quality_score, 100),
+            ),
+            account,
+            runtime.risk,
+            runtime.strategy_profile,
+            spec,
+            positions,
+        )
+        if not risk.allowed:
+            return None, f"Fresh risk calculation rejected the order: {risk.reason}"
+        if risk.risk_pct > runtime.risk.max_risk_per_trade_pct + 1e-9:
+            return None, "Fresh order exceeds the current per-trade risk limit"
+
+        candidate.entry = round(price, 5)
+        candidate.volume = risk.volume
+        candidate.risk_amount = risk.risk_amount
+        candidate.risk_pct = risk.risk_pct
+        candidate.reward_risk = round(reward_risk, 2)
+        candidate.spread_at_signal = quote.spread
+        return (
+            OrderRequest(
+                side=side,
+                volume=risk.volume,
+                entry=price,
+                stop_loss=candidate.stop_loss,
+                take_profit=candidate.take_profit,
+                client_order_id=idempotency_key,
+                candidate_id=candidate.id,
+                max_price_deviation=allowed_drift,
+            ),
+            None,
+        )

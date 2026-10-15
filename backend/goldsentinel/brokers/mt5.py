@@ -130,13 +130,29 @@ class MT5Broker(Broker):
             return BrokerResult(success=False, state="REJECTED", message="GoldSentinel refuses non-demo MT5 order submission")
         spec = self.symbol_spec(symbol)
         volume = self._round_volume(order.volume, spec["volume_step"])
-        if volume < spec["volume_min"]:
-            return BrokerResult(success=False, state="REJECTED", message="Rounded volume is below broker minimum")
+        if volume < spec["volume_min"] or volume > spec["volume_max"]:
+            return BrokerResult(success=False, state="REJECTED", message="Rounded volume is outside broker limits")
         quote = self.quote(symbol)
         side_type = self.mt5.ORDER_TYPE_BUY if order.side == Side.buy else self.mt5.ORDER_TYPE_SELL
         price = quote.ask if order.side == Side.buy else quote.bid
+        if order.max_price_deviation is not None and abs(price - order.entry) > order.max_price_deviation:
+            return BrokerResult(success=False, state="REJECTED", message="Executable price moved beyond the approved slippage limit")
+        min_stop = float(spec["trade_stops_level"]) * float(spec["point"])
+        if order.side == Side.buy:
+            valid_levels = order.stop_loss < price < order.take_profit
+            stop_distance = price - order.stop_loss
+            target_distance = order.take_profit - price
+        else:
+            valid_levels = order.take_profit < price < order.stop_loss
+            stop_distance = order.stop_loss - price
+            target_distance = price - order.take_profit
+        if not valid_levels:
+            return BrokerResult(success=False, state="REJECTED", message="SL/TP direction is invalid at the executable price")
+        if min(stop_distance, target_distance) < min_stop:
+            return BrokerResult(success=False, state="REJECTED", message="SL/TP violates broker stop-distance requirements")
+        deviation = max(1, min(100, round((order.max_price_deviation or spec["point"] * 20) / spec["point"])))
         fill_map = {"FOK": self.mt5.ORDER_FILLING_FOK, "IOC": self.mt5.ORDER_FILLING_IOC, "RETURN": self.mt5.ORDER_FILLING_RETURN}
-        base: dict[str, Any] = {"action": self.mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": volume, "type": side_type, "price": price, "sl": order.stop_loss, "tp": order.take_profit, "deviation": 20, "magic": 260115, "comment": f"GS:{order.client_order_id[:20]}", "type_time": self.mt5.ORDER_TIME_GTC}
+        base: dict[str, Any] = {"action": self.mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": volume, "type": side_type, "price": price, "sl": order.stop_loss, "tp": order.take_profit, "deviation": deviation, "magic": 260115, "comment": f"GS:{order.client_order_id[:20]}", "type_time": self.mt5.ORDER_TIME_GTC}
         last = None
         for mode in spec["filling_modes"]:
             request = {**base, "type_filling": fill_map[mode]}

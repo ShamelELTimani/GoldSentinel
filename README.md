@@ -38,9 +38,24 @@ For an already installed and logged-in MetaTrader 5 Windows terminal:
 
 The adapter verifies demo status again immediately before submission. FOK/IOC/RETURN are selected only from the symbol's broker-supported filling modes. Order states are reconciled against broker positions; uncertain submissions are quarantined by idempotency key.
 
-## News providers
+## Calendar and headline providers
 
-GoldSentinel supports native Financial Modeling Prep (`fmp`) and the original `generic_json` adapter. No commercial provider or credential is silently selected.
+GoldSentinel supports a credential-free Forex Factory-compatible weekly calendar (`forex_factory`), native Financial Modeling Prep (`fmp`), and the original `generic_json` adapter. Economic-calendar availability and financial headlines are tracked independently, so a headline outage cannot hide the calendar state and a calendar failure cannot suppress useful headlines. No commercial provider or credential is silently selected.
+
+### Credential-free weekly calendar
+
+The example configuration uses the public weekly JSON feed:
+
+```dotenv
+GS_CALENDAR_PROVIDER=forex_factory
+GS_CALENDAR_URL=https://nfs.faireconomy.media/ff_calendar_thisweek.json
+GS_CALENDAR_API_KEY=
+GS_CALENDAR_COUNTRY=US
+GS_NEWS_FAIL_SAFE=true
+GS_NEWS_REFRESH_SECONDS=300
+```
+
+This adapter accepts the feed's `title`, `country`, `date`, `impact`, `forecast`, `actual`, and `previous` fields, then keeps US/USD macro releases relevant to gold. Its offset-free timestamps are interpreted in the feed's America/New_York timezone and normalized to UTC, including daylight-saving transitions. A successful empty list is `VERIFIED_EMPTY`; malformed data, stale cache, HTTP failures, and permission responses are unavailable. The URL is configurable because the public feed is an external dependency whose availability is not controlled by GoldSentinel.
 
 ### Financial Modeling Prep
 
@@ -59,7 +74,7 @@ GS_NEWS_REFRESH_SECONDS=300
 
 `GS_CALENDAR_URL` may be left empty when using `fmp`; GoldSentinel then uses the official stable endpoint shown above. The API key is sent only as FMP's documented `apikey` query parameter. It is never sent as a Bearer token or included in status/error output. The adapter sends `country=US` plus inclusive `from` and `to` dates. `GS_CALENDAR_DAYS_BACK + GS_CALENDAR_DAYS_AHEAD` must be at most 89, keeping the inclusive range within FMP's 90-day maximum.
 
-FMP's offset-free `date` values are interpreted as UTC. The adapter validates the documented array response, maps `event`, `date`, `impact`, `estimate`, `actual`, `previous`, `currency`, `country`, and `unit`, filters to US/USD releases relevant to gold, and calculates actual-versus-estimate surprise when both values are numeric. HTTP 401/403, permission messages, malformed objects, invalid timestamps/impact values, stale data, outages, and HTTP 429 are unavailable states. A successful empty array is reported separately as `VERIFIED_EMPTY` and does not masquerade as an outage.
+FMP's offset-free `date` values are interpreted as UTC. The adapter validates the documented array response, maps `event`, `date`, `impact`, `estimate`, `actual`, `previous`, `currency`, `country`, and `unit`, filters to US/USD releases relevant to gold, and calculates actual-versus-estimate surprise when both values are numeric. HTTP 401/403, HTTP 402 (subscription/payment required), permission messages, malformed objects, invalid timestamps/impact values, stale data, outages, and HTTP 429 are unavailable states. A successful empty array is reported separately as `VERIFIED_EMPTY` and does not masquerade as an outage.
 
 Requests are cached for `GS_NEWS_REFRESH_SECONDS`; concurrent refreshes are serialized. A 429 `Retry-After` value is honored, so dashboard polling does not consume FMP quota. Access to the economic-calendar endpoint may depend on the FMP subscription attached to your personal key.
 
@@ -73,13 +88,26 @@ The endpoint must return either a JSON array or `{ "events": [...] }`. Each rele
 - `timestamp` or `date` as ISO-8601, preferably with `Z` or an explicit offset
 - `impact` (`HIGH`, `MEDIUM`, or `LOW`)
 
-Optional fields are `id`, `currency`, `actual`, `forecast`, and `previous`. GoldSentinel retains the endpoint URL as the source and only imports gold-relevant macro events such as CPI, PPI, NFP/payrolls, PCE, Fed/FOMC, GDP, unemployment, retail sales, and ISM. Set `GS_NEWS_URL` separately for `{ "articles": [...] }` or an array of headlines.
+Optional fields are `id`, `currency`, `actual`, `forecast`, and `previous`. GoldSentinel retains the endpoint URL as the source and only imports gold-relevant macro events such as CPI, PPI, NFP/payrolls, PCE, Fed/FOMC, GDP, unemployment, retail sales, and ISM.
+
+### Independent financial headlines
+
+Headlines never substitute for the economic calendar and do not clear the news fail-safe. Configure them independently with either `rss` or `generic_json`:
+
+```dotenv
+GS_NEWS_PROVIDER=rss
+GS_NEWS_URL=https://news.google.com/rss/search?q=gold%20OR%20XAUUSD%20OR%20Federal%20Reserve%20OR%20US%20inflation&hl=en-US&gl=US&ceid=US:en
+GS_NEWS_API_KEY=
+GS_HEADLINE_REFRESH_SECONDS=300
+```
+
+The RSS adapter reads standard RSS/Atom items and filters for gold, USD, inflation, labor, central-bank, and geopolitical context. The generic adapter accepts `{ "articles": [...] }` or a JSON array and may use a Bearer key. Calendar and headline retry timers are separate, minimizing requests and allowing either source to recover independently.
 
 No feed credential is bundled because provider credentials and licensing belong to the operator. The backend refreshes configured providers every `GS_NEWS_REFRESH_SECONDS` (default 300). A configured feed is unavailable until its first successful refresh and becomes stale after three missed refresh intervals. With `GS_NEWS_FAIL_SAFE=true` and the Conservative policy, unavailable or stale calendar data is **not** treated as a clear market: entries and arming are blocked and the dashboard displays the provider state, next high-impact USD event, countdown, release values, surprise, and active restriction.
 
 ## Trading readiness and execution blockers
 
-The dashboard's Trading Readiness panel is generated by the backend. It independently reports MT5/demo connectivity and source, M15 market-data validity, news availability, combined exposure/position limits, FULL_AUTO mode, pause state, emergency stop, and explicit arming state.
+The dashboard's Trading Readiness panel is generated by the backend. It independently reports MT5/demo connectivity and source, M15 market-data validity, news availability, combined exposure/position limits, FULL_AUTO mode, pause state, emergency stop, and explicit arming state. Quote health is shown separately as `LIVE`, `QUIET`, `STALE`, or `DISCONNECTED`; stale or missing broker quotes are never replaced with mock prices in MT5 mode.
 
 - `Resume` means persisted `paused=true`; resuming never rearms the bot.
 - Selecting another mode, changing settings, pausing, resetting an emergency stop, or restarting always disarms automatic execution.
@@ -89,6 +117,10 @@ The dashboard's Trading Readiness panel is generated by the backend. It independ
 - A valid BUY/SELL can still show `BLOCKED_OPERATIONAL` when the signal exists but mode, pause, news, emergency, or arming state prevents submission.
 
 `GET /api/market-diagnostics` performs a read-only nine-timeframe validation. Normal XAU/USD daily maintenance and weekend closures are recorded as expected gaps rather than feed failures; recent unexpected gaps remain blocking, while old broker-history gaps remain visible as non-blocking warnings.
+
+The strategy evaluates all active zones instead of stopping at the nearest zone. It ranks trend pullbacks/continuations and range-boundary reversals, applies profile-specific distance and quality thresholds, and computes reward-to-risk from the executable Ask for BUY or Bid for SELL. Immediately before a submission, execution fetches a new broker quote, rejects excessive price drift or spread, revalidates stop direction and the broker minimum stop distance, recalculates volume from current equity/exposure, and checks reward-to-risk again. These checks do not bypass the explicit arming, pause, news, demo-account, or risk gates.
+
+The dashboard uses `GET /api/quote` for lightweight quotes and `GET /api/market/{timeframe}/live` for the current candle. Full chart history is loaded only on initial view, timeframe changes, or manual reload. The chart instance is retained across updates, preserving zoom and scroll; the reset-view button is the explicit way to fit all data again.
 
 ## Architecture
 
@@ -116,12 +148,12 @@ npm run typecheck
 npm run build
 ```
 
-Automated tests always use mock execution. They cover nine timeframes, candle validation, incomplete-candle handling, zone generation, risk caps, risk profiles, wider-stop sizing, minimum-volume rejection, total exposure, idempotent submission, stop widening, replay/backtest behavior, authentication, and backend setting validation.
+Automated tests always use mock execution. They cover nine timeframes, candle validation, incomplete-candle handling, multi-zone selection, executable-price and slippage checks, risk caps, risk profiles, wider-stop sizing, minimum-volume rejection, total exposure, idempotent submission, stop widening, calendar/headline response handling, replay/backtest behavior, authentication, and backend setting validation.
 
 ## Current integration status and limits
 
 - The MT5 implementation is complete but cannot be certified against your JustMarkets terminal without a running, logged-in demo terminal. Validate symbol suffix, filling modes, stop level, contract size, partial fills, and reconciliation on that account before use.
-- The FMP and generic calendar adapters are implemented. Live FMP operation still requires a personal API key whose subscription permits the stable economic-calendar endpoint.
+- The credential-free weekly, FMP, and generic calendar adapters are implemented. An FMP `402` means the supplied key's subscription does not permit that endpoint; use a compatible subscription or select the credential-free provider. The news fail-safe remains enabled in either case.
 - Backtest results are evidence, not a guarantee. Results under 100 trades are explicitly marked statistically limited. Bar-level simulation resolves same-bar SL/TP ambiguity against the strategy (stop first).
 - Mock market data is confined to mock mode. Selecting MT5 uses genuine MT5 candles and quotes; provider failure is surfaced rather than replaced with mock data.
 - The service includes broker-side SL/TP modification, full/partial close, pending cancellation, breakeven-compatible stop tightening, and audit persistence. ATR trailing/partial-profit automation should be enabled only after broker-specific demo verification.
