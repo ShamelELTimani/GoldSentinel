@@ -1,0 +1,59 @@
+GOLDSENTINEL READ-ONLY MONITOR — LATEST REPORT
+Generated UTC: 2026-10-15T18:22:45+00:00
+Monitoring started UTC: 2026-10-15T18:21:35+00:00
+API: http://127.0.0.1:8000 (local GET requests only)
+Samples collected: 8; market scans: 2
+Last API error: none
+
+BROKER & PRICES
+Broker: MT5 | symbol: XAUUSD.m | connected: True
+Bid/Ask: 4157.1 / 4157.36 | quote timestamp: 2026-10-15T18:22:45.724000Z
+Quote age: 0.060593 seconds (old ticks are possible during market closures)
+Observed price changes since start: 7; quote timestamp changes: 7
+Most recent observed price change: 2026-10-15T18:22:45+00:00
+Equity: 212.57 | DEMO: True
+
+SAFETY & RISK
+Runtime: {'mode': 'FULL_AUTO', 'strategy_profile': 'BALANCED', 'risk': {'max_risk_per_trade_pct': 5.0, 'max_combined_risk_pct': 6.0, 'max_positions': 10, 'daily_drawdown_stop_pct': 6.0, 'consecutive_loss_limit': 4, 'cooldown_minutes': 60, 'preferred_min_rr': 1.5, 'news_policy': 'BALANCED'}, 'paused': False, 'emergency_stop': False, 'armed': False}
+Readiness: False | blockers: ['Automatic order submission is disarmed']
+Open positions: 0 | pending orders: 0
+Backend reported open risk: 0 (may be understated for MT5 positions)
+Independent APPROXIMATE stop-based open risk: 0.00 USD
+Risk estimate incomplete because of missing/invalid SL: False
+Per-trade max risk: 5.0% | combined max risk: 6.0%
+
+DECISIONS & ORDERS
+Latest decision: SELL / TRADE / BLOCKED_OPERATIONAL
+Latest rationale: Risk fits per-trade, combined exposure, volume, and circuit-breaker limits
+Audit signal count since monitoring began: 35
+BUY signals: 0; SELL signals: 35; NO_TRADE: 0
+Order submissions: 0 | order results: 0 | preflight rejections: 0
+Top NO_TRADE explanations (since monitoring started):
+  None captured yet
+
+M15 ZONES & MARKET QUALITY
+Market quality: True | structure: BEARISH
+ATR: 6.696037888516961
+  BUY 4096.61-4098.58 raw_score=72.9 touches=0
+  BUY 4136.27-4140.27 raw_score=66.0 touches=12
+  SELL 4150.29-4155.66 raw_score=63.4 touches=46
+  SELL 4156.43-4168.55 raw_score=56.2 touches=10
+  SELL 4158.2-4161.69 raw_score=54.3 touches=19
+  SELL 4156.45-4159.24 raw_score=54.2 touches=15
+  BUY 4143.7-4145.9 raw_score=50.1 touches=2
+  SELL 4157.57-4160.49 raw_score=50.0 touches=16
+
+NEWS
+Calendar: RATE_LIMITED | error: Calendar provider rate limit reached; refresh is deferred
+Events: 0 | headlines: 47
+Headline error: None | news restriction: UNAVAILABLE
+
+NOTES
+- This script only monitors API data, it does not place trades or change settings.
+- No connection to ChatGPT or external notification service is established.
+- Audit counts start at the monitor's first audit fetch, not at account inception.
+- MT5 open-risk reporting and broker fills should be validated independently.
+- Check logs before sharing: they may include trading/account details, but no API key is requested.
+
+LOG LOCATION
+C:\Users\shame\Projects\GoldSentinel\monitoring
